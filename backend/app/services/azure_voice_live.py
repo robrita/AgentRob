@@ -28,14 +28,23 @@ logger = logging.getLogger("agentrob.voice")
 #   AZURE_VOICE_LIVE_API_VERSION: API version (default: 2025-10-01)
 #   AI_FOUNDRY_AGENT_CONNECTION_STRING or AZURE_VOICELIVE_AGENT_CONNECTION_STRING: hub-based projects
 #   AZURE_VOICELIVE_API_KEY or AZURE_VOICE_LIVE_API_KEY: Voice Live API key (service auth; agent token still required)
-#   AZURE_VOICELIVE_TTS_VOICE: TTS voice name (e.g., en-IN-Meera:DragonHDV2.3Neural)
-#   AZURE_VOICELIVE_TTS_VOICE_TYPE: Voice type - azure-standard, openai, etc. (default: azure-standard)
+#   AZURE_VOICELIVE_TTS_VOICE: TTS voice name (e.g., en-IN-Meera:DragonHDV2.3Neural for standard voices)
+#   AZURE_VOICELIVE_TTS_VOICE_TYPE: Voice type - azure-standard, azure-personal, azure-custom, openai (default: azure-standard)
 #   AZURE_VOICELIVE_TTS_TEMPERATURE: TTS temperature for voice variation (default: 0.8)
+#   AZURE_VOICELIVE_SPEAKER_PROFILE_ID: Speaker profile ID for Personal Voice (required when voice_type is azure-personal)
+#   AZURE_VOICELIVE_TTS_BASE_VOICE: Base voice for Personal Voice synthesis (default: DragonLatestNeural)
 #   AZURE_VOICELIVE_VAD_THRESHOLD: Voice activity detection threshold (default: 0.3)
 #   AZURE_VOICELIVE_VAD_PREFIX_PADDING_MS: VAD prefix padding in milliseconds (default: 200)
 #   AZURE_VOICELIVE_VAD_SILENCE_DURATION_MS: Silence duration threshold in milliseconds (default: 200)
 #   AZURE_VOICELIVE_AUDIO_SAMPLING_RATE: Input audio sampling rate in Hz (default: 24000)
 #   AZURE_VOICE_LIVE_TRANSCRIPTION_LANGUAGES: Comma-separated language codes (default: en-US)
+#
+# Personal Voice Usage:
+#   To use Azure Personal Voice (custom personal voice), set:
+#     AZURE_VOICELIVE_TTS_VOICE_TYPE=azure-personal
+#     AZURE_VOICELIVE_SPEAKER_PROFILE_ID=<your-speaker-profile-id>
+#     AZURE_VOICELIVE_TTS_BASE_VOICE=DragonLatestNeural (or PhoenixLatestNeural for word boundary events)
+#   The speaker profile ID is generated when you create a Personal Voice via the Custom Voice API.
 #
 # Authentication:
 #   Uses DefaultAzureCredential (supports: environment variables, managed identity, CLI login, etc.)
@@ -58,6 +67,8 @@ class AzureVoiceLiveConfig:
         self.tts_voice = os.getenv("AZURE_VOICELIVE_TTS_VOICE")
         self.tts_voice_type = os.getenv("AZURE_VOICELIVE_TTS_VOICE_TYPE", "azure-standard")
         self.tts_temperature = os.getenv("AZURE_VOICELIVE_TTS_TEMPERATURE")
+        self.speaker_profile_id = os.getenv("AZURE_VOICELIVE_SPEAKER_PROFILE_ID")
+        self.tts_base_voice = os.getenv("AZURE_VOICELIVE_TTS_BASE_VOICE", "DragonLatestNeural")
         self.fallback_model = os.getenv("AZURE_VOICELIVE_MODEL", "gpt-4o-mini-realtime-preview")
 
         self.vad_threshold = os.getenv("AZURE_VOICELIVE_VAD_THRESHOLD")
@@ -149,9 +160,16 @@ class AzureVoiceLiveConfig:
 
 
 def _build_turn_detection(config: AzureVoiceLiveConfig) -> dict[str, Any]:
-    threshold = 0.3
-    prefix_padding_ms = 200
-    silence_duration_ms = 200
+    """Build turn detection config for server-side VAD.
+
+    Uses azure_semantic_vad which automatically detects speech end and commits.
+    When server-side VAD is enabled, input_audio_buffer.commit should NOT be sent.
+    """
+    # Higher threshold = less sensitive = fewer false triggers on ambient noise
+    # Use 0.7 for hybrid mode to avoid triggering on silence
+    threshold = 0.7 if _is_personal_voice_hybrid_mode(config) else 0.5
+    prefix_padding_ms = 300  # Reduced for faster response
+    silence_duration_ms = 400  # Reduced for faster turn detection
 
     if config.vad_threshold:
         with suppress(ValueError):
@@ -175,15 +193,40 @@ def _build_turn_detection(config: AzureVoiceLiveConfig) -> dict[str, Any]:
 
 
 def _build_voice_config(config: AzureVoiceLiveConfig) -> dict[str, Any] | None:
-    if not config.tts_voice:
-        return None
+    """Build voice configuration for Voice Live session.
+
+    Supports multiple voice types:
+    - azure-standard: Standard Azure TTS voices (e.g., en-US-Ava:DragonHDLatestNeural)
+    - azure-personal: HYBRID MODE - Voice Live returns text only, audio is synthesized separately
+    - azure-custom: Custom Neural Voice
+    - openai: OpenAI voices
+
+    For azure-personal (hybrid mode):
+      - Voice Live is configured for TEXT-ONLY output (no voice config sent)
+      - Audio is synthesized by Speech SDK with Personal Voice SSML
+    """
+    voice_type = (config.tts_voice_type or "azure-standard").strip().lower()
+
     temperature = 0.8
     if config.tts_temperature:
         with suppress(ValueError):
             temperature = float(config.tts_temperature)
+
+    # Handle Personal Voice (azure-personal) - HYBRID MODE
+    # Don't configure voice on Voice Live - we synthesize audio separately with Speech SDK
+    if voice_type == "azure-personal":
+        logger.info(
+            "Personal Voice HYBRID MODE: Voice Live will return text-only, "
+            "audio will be synthesized by Speech SDK"
+        )
+        return None  # No voice config = text-only from Voice Live
+
+    # Standard/Custom/OpenAI voice types
+    if not config.tts_voice:
+        return None
     return {
         "name": config.tts_voice,
-        "type": (config.tts_voice_type or "azure-standard").strip().lower(),
+        "type": voice_type,
         "temperature": temperature,
     }
 
@@ -196,14 +239,24 @@ def _build_session_config(config: AzureVoiceLiveConfig) -> dict[str, Any]:
 
     session: dict[str, Any] = {
         "input_audio_sampling_rate": sampling_rate,
-        "turn_detection": _build_turn_detection(config),
         "input_audio_noise_reduction": {"type": "azure_deep_noise_suppression"},
-        "input_audio_echo_cancellation": {"type": "server_echo_cancellation"},
         "input_audio_transcription": {
             "model": "azure-speech",
             "language": config.transcription_languages,
         },
     }
+
+    # In hybrid mode (Personal Voice), use server-side VAD but request text-only output
+    # Server VAD handles speech detection; we synthesize audio ourselves
+    if _is_personal_voice_hybrid_mode(config):
+        session["turn_detection"] = _build_turn_detection(config)
+        session["modalities"] = ["text"]  # Text only - we synthesize audio
+        # Echo cancellation works with server-side VAD
+        session["input_audio_echo_cancellation"] = {"type": "server_echo_cancellation"}
+        logger.info("Hybrid mode: Using server VAD with text-only output modalities")
+    else:
+        session["turn_detection"] = _build_turn_detection(config)
+        session["input_audio_echo_cancellation"] = {"type": "server_echo_cancellation"}
 
     voice = _build_voice_config(config)
     if voice:
@@ -212,14 +265,25 @@ def _build_session_config(config: AzureVoiceLiveConfig) -> dict[str, Any]:
     return session
 
 
+def _is_personal_voice_hybrid_mode(config: AzureVoiceLiveConfig) -> bool:
+    """Check if Personal Voice hybrid mode is enabled."""
+    voice_type = (config.tts_voice_type or "azure-standard").strip().lower()
+    return voice_type == "azure-personal"
+
+
 def _build_response_config(config: AzureVoiceLiveConfig, modalities: list[str] | None = None) -> dict[str, Any]:
+    # In hybrid mode (Personal Voice), use text-only since we synthesize audio separately
+    if _is_personal_voice_hybrid_mode(config):
+        return {
+            "modalities": ["text"],
+        }
+    
     resolved_modalities = modalities or ["text", "audio"]
     response: dict[str, Any] = {
         "modalities": resolved_modalities,
     }
     if "audio" in resolved_modalities:
         response["output_audio_format"] = "pcm16"
-        response["output_audio_sampling_rate"] = config.output_audio_sampling_rate
     return response
 
 
@@ -245,6 +309,8 @@ class VoiceLiveAgentConnection:
         cfg.tts_voice = self.config.tts_voice
         cfg.tts_voice_type = self.config.tts_voice_type
         cfg.tts_temperature = self.config.tts_temperature
+        cfg.speaker_profile_id = self.config.speaker_profile_id
+        cfg.tts_base_voice = self.config.tts_base_voice
         cfg.vad_threshold = self.config.vad_threshold
         cfg.vad_prefix_padding_ms = self.config.vad_prefix_padding_ms
         cfg.vad_silence_duration_ms = self.config.vad_silence_duration_ms
@@ -453,6 +519,7 @@ def connect_realtime() -> VoiceLiveAgentConnection:
 async def configure_voice_live_session(target: VoiceLiveAgentConnection) -> None:
     config = AzureVoiceLiveConfig()
     session = _build_session_config(config)
+    logger.info("Sending session.update with config: %s", json.dumps(session, indent=2))
     await target.send_event("session.update", {"session": session})
 
 
@@ -490,7 +557,15 @@ async def handle_client_message(target: VoiceLiveAgentConnection, message: str) 
         return
 
     if message_type == "input_audio_buffer.commit":
-        await target.send_event("input_audio_buffer.commit")
+        config = AzureVoiceLiveConfig()
+        if _is_personal_voice_hybrid_mode(config):
+            # In hybrid mode with server VAD, skip client commits
+            # Server VAD auto-commits when speech ends
+            logger.debug("Hybrid mode: Skipping client commit (server VAD auto-commits)")
+        else:
+            # Server-side VAD (azure_semantic_vad) auto-commits when speech ends.
+            # Skip forwarding commit to Azure when using server-side VAD.
+            logger.debug("Skipping input_audio_buffer.commit (server-side VAD auto-commits)")
         return
 
     if message_type == "input_audio_buffer.clear":
