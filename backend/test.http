@@ -1,0 +1,59 @@
+@host = http://localhost:8000
+@sessionId = 
+
+### Health
+GET {{host}}/api/health
+
+### Create session
+POST {{host}}/api/session
+Content-Type: application/json
+
+{}
+
+### Get session (set @sessionId from create response)
+GET {{host}}/api/session/{{sessionId}}
+
+### Toggle mic
+POST {{host}}/api/session/{{sessionId}}/mic
+Content-Type: application/json
+
+{
+  "listening": true
+}
+
+### Pause/resume
+POST {{host}}/api/session/{{sessionId}}/pause
+Content-Type: application/json
+
+{
+  "paused": false
+}
+
+### Toggle sounds
+POST {{host}}/api/session/{{sessionId}}/sounds
+Content-Type: application/json
+
+{
+  "enabled": true
+}
+
+### Send text message
+POST {{host}}/api/session/{{sessionId}}/message
+Content-Type: application/json
+
+{
+  "text": "Hello AgentRob",
+  "author": "You"
+}
+
+### Get transcript
+GET {{host}}/api/session/{{sessionId}}/transcript
+
+### Leave session
+POST {{host}}/api/session/{{sessionId}}/leave
+Content-Type: application/json
+
+{}
+
+### Realtime websocket
+# ws://localhost:8000/api/session/{{sessionId}}/realtime
