@@ -1,3 +1,5 @@
+![AgentRob](public/AgentRob.png)
+
 # AgentRob (Vite)
 
 ## Local development
