@@ -536,12 +536,15 @@ def serialize_server_event(event: Any, inject_sample_rate: int | None = None) ->
         return event
     if isinstance(event, dict):
         event_type = event.get("type", "")
-        if inject_sample_rate and (
-            event_type.startswith("response.audio")
-            or event_type.startswith("response.output_audio")
+        if (
+            inject_sample_rate
+            and (
+                event_type.startswith("response.audio")
+                or event_type.startswith("response.output_audio")
+            )
+            and "audio_sampling_rate" not in event
         ):
-            if "audio_sampling_rate" not in event:
-                event = {**event, "audio_sampling_rate": inject_sample_rate}
+            event = {**event, "audio_sampling_rate": inject_sample_rate}
         return json.dumps(event)
     return json.dumps({"type": "unknown", "payload": event})
 
