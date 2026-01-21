@@ -219,7 +219,8 @@ def _build_response_config(config: AzureVoiceLiveConfig, modalities: list[str] |
     }
     if "audio" in resolved_modalities:
         response["output_audio_format"] = "pcm16"
-        response["output_audio_sampling_rate"] = config.output_audio_sampling_rate
+        # Note: output_audio_sampling_rate is set in session.update, not response.create
+        # Azure Voice Live API rejects this field in response.create
     return response
 
 
@@ -514,6 +515,25 @@ async def handle_client_message(target: VoiceLiveAgentConnection, message: str) 
 
     if message_type == "response.cancel":
         await target.send_event("response.cancel")
+        return
+
+    if message_type == "text.send":
+        text = data.get("text") or data.get("payload", {}).get("text")
+        if text:
+            await target.send_event(
+                "conversation.item.create",
+                {
+                    "item": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": text}],
+                    }
+                },
+            )
+            config = AzureVoiceLiveConfig()
+            response_data = _build_response_config(config, ["text", "audio"])
+            await target.send_event("response.create", {"response": response_data})
+            logger.info("Sent text input via realtime: %s", text[:50] if len(text) > 50 else text)
         return
 
 

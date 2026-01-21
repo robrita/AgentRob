@@ -207,6 +207,9 @@ async def realtime(session_id: str, websocket: WebSocket) -> None:
     # Get the configured output audio sample rate to inject into events
     output_sample_rate = get_output_audio_sampling_rate()
 
+    # Keep-alive interval in seconds (send ping every 2 minutes to prevent Azure idle timeout)
+    KEEPALIVE_INTERVAL = 120
+
     try:
         async with connect_realtime() as azure_conn:
             await configure_voice_live_session(azure_conn)
@@ -252,9 +255,24 @@ async def realtime(session_id: str, websocket: WebSocket) -> None:
                 except Exception:  # noqa: BLE001
                     await websocket.close(code=1011)
 
+            async def keepalive() -> None:
+                """Send periodic empty audio buffer to prevent Azure idle timeout."""
+                try:
+                    while True:
+                        await anyio.sleep(KEEPALIVE_INTERVAL)
+                        # Send a minimal silent audio chunk to keep connection alive
+                        # This is a tiny PCM16 silent sample (4 bytes = 2 samples at 0)
+                        import base64
+                        silent_audio = base64.b64encode(b"\x00\x00\x00\x00").decode()
+                        await azure_conn.send_event("input_audio_buffer.append", {"audio": silent_audio})
+                        logger.debug("Sent keepalive ping to Azure Voice Live")
+                except Exception:  # noqa: BLE001
+                    pass  # Keepalive failure is not fatal
+
             async with anyio.create_task_group() as tg:
                 tg.start_soon(client_to_azure)
                 tg.start_soon(azure_to_client)
+                tg.start_soon(keepalive)
     except Exception as exc:  # noqa: BLE001
         try:
             if websocket.application_state.name != "DISCONNECTED":

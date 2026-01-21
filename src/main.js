@@ -146,6 +146,36 @@ let firstAudioChunkReady = null;
 let resolveFirstAudioChunk = null;
 const micLog = (...args) => console.debug("[mic]", ...args);
 
+// Module-level agent message state for realtime WebSocket (shared by voice + text)
+let realtimeAgentIndex = null;
+let realtimeAgentText = "";
+
+const ensureRealtimeAgentMessage = () => {
+  if (realtimeAgentIndex !== null) return;
+  transcriptData.push({ author: "AgentRob", text: "" });
+  realtimeAgentIndex = transcriptData.length - 1;
+  if (typeof applyFilters === "function") {
+    applyFilters();
+  } else {
+    renderData(transcriptData, transcriptBody);
+  }
+};
+
+const updateRealtimeAgentMessage = (text) => {
+  if (realtimeAgentIndex === null) return;
+  transcriptData[realtimeAgentIndex].text = text;
+  if (typeof applyFilters === "function") {
+    applyFilters();
+  } else {
+    renderData(transcriptData, transcriptBody);
+  }
+};
+
+const resetRealtimeAgentMessage = () => {
+  realtimeAgentIndex = null;
+  realtimeAgentText = "";
+};
+
 setupAudioVisualizer();
 
 const apiFetch = async (path, options = {}) => {
@@ -523,29 +553,8 @@ const ensureRealtimeSocket = async () => {
       micSocket = null;
       micSocketReady = null;
     });
-    let agentIndex = null;
-    let agentText = "";
-
-    const ensureAgentMessage = () => {
-      if (agentIndex !== null) return;
-      transcriptData.push({ author: "AgentRob", text: "" });
-      agentIndex = transcriptData.length - 1;
-      if (applyFilters) {
-        applyFilters();
-      } else {
-        renderData(transcriptData, transcriptBody);
-      }
-    };
-
-    const updateAgentMessage = (text) => {
-      if (agentIndex === null) return;
-      transcriptData[agentIndex].text = text;
-      if (applyFilters) {
-        applyFilters();
-      } else {
-        renderData(transcriptData, transcriptBody);
-      }
-    };
+    // Agent message state is now at module level (realtimeAgentIndex, realtimeAgentText)
+    // Use ensureRealtimeAgentMessage() and updateRealtimeAgentMessage() instead
 
     micSocket.addEventListener("message", (event) => {
       try {
@@ -578,30 +587,27 @@ const ensureRealtimeSocket = async () => {
           type === "response.text.delta" ||
           type === "response.audio_transcript.delta"
         ) {
-          // Also reject text from cancelled responses
+          // Reject text from cancelled responses
           if (isResponseCancelled) {
-            console.debug("[voice] rejecting text delta - response cancelled");
             return;
           }
           const delta = payload?.delta?.text || payload?.delta;
-          if (typeof delta === "string" && delta.trim()) {
-            ensureAgentMessage();
-            agentText += delta;
-            updateAgentMessage(agentText);
+          if (typeof delta === "string" && delta) {
+            ensureRealtimeAgentMessage();
+            realtimeAgentText += delta;
+            updateRealtimeAgentMessage(realtimeAgentText);
           }
         }
         
         // When a new response starts, stop any old audio FIRST and clear rejection
         if (type === "response.created" || type === "response.started") {
-          console.debug("[voice] NEW RESPONSE started, id:", responseId, "- now accepting audio");
           stopAllPlayback(false); // Not an interrupt, just cleanup
           currentResponseId = responseId || Date.now().toString();
           cancelledResponseId = null;
           isResponseCancelled = false; // Clear rejection flag - accept audio from new response
           audioAcceptedAfter = Date.now(); // Only accept audio from now
           // Reset agent message for new response
-          agentIndex = null;
-          agentText = "";
+          resetRealtimeAgentMessage();
         }
         
         // Handle response cancellation/interruption from server
@@ -668,8 +674,8 @@ const ensureRealtimeSocket = async () => {
           type === "response.audio_transcript.done"
         ) {
           micResponding = false;
-          agentIndex = null;
-          agentText = "";
+          // Use module-level reset instead of local variables
+          resetRealtimeAgentMessage();
         }
       } catch {
         // ignore non-json events for now
@@ -820,6 +826,8 @@ let cancelledResponseId = null; // Track the response that was cancelled to reje
 let lastInterruptTime = 0; // Track when last interrupt happened
 let audioAcceptedAfter = 0; // Only accept audio received after this timestamp
 let isResponseCancelled = false; // Flag to reject all audio until new response
+let masterGainNode = null; // Master gain for instant muting during interrupts
+let playbackVersion = 0; // Incremented on each cancel to invalidate queued audio
 const INTERRUPT_DELAY_MS = 1500; // Delay before playing new audio after interrupt
 
 /**
@@ -830,6 +838,14 @@ const stopAllPlayback = (isInterrupt = false) => {
   const sourceCount = activeAudioSources.length;
   if (sourceCount > 0) {
     console.debug("[voice] stopping all playback, active sources:", sourceCount);
+  }
+  
+  // Increment version to invalidate all queued audio
+  playbackVersion++;
+  
+  // FIRST: Immediately mute via gain node (instant, no latency)
+  if (masterGainNode) {
+    masterGainNode.gain.setValueAtTime(0, playbackContext?.currentTime || 0);
   }
   
   // Stop all active audio sources immediately
@@ -850,6 +866,18 @@ const stopAllPlayback = (isInterrupt = false) => {
   // Record interrupt time for delay before new audio
   if (isInterrupt) {
     lastInterruptTime = Date.now();
+    
+    // Close and recreate the AudioContext to fully clear the audio pipeline
+    if (playbackContext) {
+      try {
+        playbackContext.close();
+      } catch (e) {
+        // Ignore close errors
+      }
+      playbackContext = null;
+      playbackAnalyser = null;
+      masterGainNode = null;
+    }
   }
 };
 
@@ -858,6 +886,12 @@ const stopAllPlayback = (isInterrupt = false) => {
  * Sends cancel event to backend and stops audio playback.
  */
 const cancelCurrentResponse = async () => {
+  // Only cancel if there's actually an active response
+  if (!currentResponseId && !micResponding) {
+    console.debug("[voice] No active response to cancel, skipping");
+    return;
+  }
+  
   // Set flag to reject ALL incoming audio until new response starts
   isResponseCancelled = true;
   
@@ -880,8 +914,8 @@ const cancelCurrentResponse = async () => {
   speechFrameCount = 0;
   
   // Send cancel event to the server (don't await - fire and forget for speed)
+  // Note: Only send response.cancel, not input_audio_buffer.clear (causes errors with server-side VAD)
   sendMicEvent("response.cancel");
-  sendMicEvent("input_audio_buffer.clear");
 };
 
 const ensurePlaybackContext = () => {
@@ -896,14 +930,26 @@ const ensurePlaybackContext = () => {
   return playbackContext;
 };
 
+const ensureMasterGain = (audioCtx) => {
+  if (!masterGainNode && audioCtx) {
+    masterGainNode = audioCtx.createGain();
+    masterGainNode.gain.value = 1.0;
+    masterGainNode.connect(audioCtx.destination);
+  }
+  return masterGainNode;
+};
+
 const ensurePlaybackAnalyser = (audioCtx) => {
   if (!audioCtx) return null;
+  // Ensure master gain exists first
+  const gain = ensureMasterGain(audioCtx);
   if (!playbackAnalyser) {
     playbackAnalyser = audioCtx.createAnalyser();
     playbackAnalyser.fftSize = 256;
     playbackAnalyser.smoothingTimeConstant = 0.85;
     playbackAnalyserData = new Uint8Array(playbackAnalyser.frequencyBinCount);
-    playbackAnalyser.connect(audioCtx.destination);
+    // Connect analyser to master gain instead of directly to destination
+    playbackAnalyser.connect(gain);
   }
   return playbackAnalyser;
 };
@@ -953,17 +999,45 @@ const audioBufferFromBase64 = async (audioCtx, base64Audio, sampleRate = AUDIO_T
   return audioBuffer;
 };
 
-const playAudioBase64 = async (base64Audio, sampleRate) => {
+const playAudioBase64 = async (base64Audio, sampleRate, capturedVersion) => {
+  // Check version - if it changed, audio is stale
+  if (capturedVersion !== playbackVersion) {
+    console.debug("[voice] play BLOCKED - version mismatch (stale audio)");
+    return;
+  }
+  
   const audioCtx = ensurePlaybackContext();
   const audioBuffer = await audioBufferFromBase64(audioCtx, base64Audio, sampleRate);
   if (!audioBuffer) return;
+  
+  // Check version again after async decode
+  if (capturedVersion !== playbackVersion) {
+    console.debug("[voice] play BLOCKED after decode - version mismatch");
+    return;
+  }
+  
+  // Ensure master gain is at full volume before playing
+  const gain = ensureMasterGain(audioCtx);
+  if (gain) {
+    gain.gain.setValueAtTime(1.0, audioCtx.currentTime);
+  }
+  
   const source = audioCtx.createBufferSource();
   source.buffer = audioBuffer;
   const analyser = ensurePlaybackAnalyser(audioCtx);
   if (analyser) {
     source.connect(analyser);
+  } else if (gain) {
+    source.connect(gain);
   } else {
     source.connect(audioCtx.destination);
+  }
+  
+  // FINAL check right before starting - this is the critical gate
+  if (capturedVersion !== playbackVersion || isResponseCancelled) {
+    console.debug("[voice] play BLOCKED at start - cancelled or version mismatch");
+    source.disconnect();
+    return;
   }
   
   // Track this source for potential interruption
@@ -1006,6 +1080,9 @@ const enqueuePlayback = (base64Audio, sampleRate) => {
     return playbackQueue;
   }
   
+  // Capture current version - if it changes, this audio is stale
+  const capturedVersion = playbackVersion;
+  
   // Check if we need to delay playback after an interrupt
   const timeSinceInterrupt = Date.now() - lastInterruptTime;
   const needsDelay = timeSinceInterrupt < INTERRUPT_DELAY_MS;
@@ -1019,6 +1096,12 @@ const enqueuePlayback = (base64Audio, sampleRate) => {
   
   playbackQueue = playbackQueue
     .then(async () => {
+      // Check version - if it changed, audio is stale
+      if (capturedVersion !== playbackVersion) {
+        console.debug("[voice] play BLOCKED - version changed while queued");
+        return;
+      }
+      
       // Check again before playing - might have been cancelled while waiting
       if (isResponseCancelled) {
         console.debug("[voice] play BLOCKED - response cancelled while queued");
@@ -1033,12 +1116,12 @@ const enqueuePlayback = (base64Audio, sampleRate) => {
       }
       
       // Check one more time after delay
-      if (isResponseCancelled) {
-        console.debug("[voice] play BLOCKED after delay - response cancelled");
+      if (isResponseCancelled || capturedVersion !== playbackVersion) {
+        console.debug("[voice] play BLOCKED after delay - cancelled or version mismatch");
         return;
       }
       
-      return playAudioBase64(base64Audio, sampleRate);
+      return playAudioBase64(base64Audio, sampleRate, capturedVersion);
     })
     .catch((err) => console.warn("[voice] playback error", err));
   return playbackQueue;
@@ -1052,29 +1135,22 @@ const sendMicEvent = async (type, payload = {}) => {
 
 const scheduleRealtimeResponses = () => {
   if (micCommitInterval) return;
+  // With server-side VAD enabled, Azure automatically:
+  // 1. Detects speech start/end
+  // 2. Commits the audio buffer when speech ends
+  // 3. Creates the response
+  // We just need a timeout to reset stale responding state
   micCommitInterval = window.setInterval(async () => {
     if (!sessionState.micListening || sessionState.paused || micStopping) return;
     const now = Date.now();
-    if (now - micLastCommitTs < 700) return;
-    micLastCommitTs = now;
-    await sendMicEvent("input_audio_buffer.commit");
-    
-    // Only create a new response if not already responding
-    // Server-side VAD will handle interruption via input_audio_buffer.speech_started
-    if (!micResponding) {
-      micResponding = true;
-      micRespondingAt = now;
-      await sendMicEvent("response.create", {
-        response: { modalities: ["text", "audio"] },
-      });
-    }
     
     // Timeout stale responses after 15 seconds
     if (micResponding && now - micRespondingAt > 15000) {
+      console.debug("[mic] response timeout, resetting state");
       micResponding = false;
       micRespondingAt = 0;
     }
-  }, 350);
+  }, 1000);
 };
 
 const stopRealtimeResponses = () => {
@@ -1112,8 +1188,8 @@ const stopMicCapture = async () => {
       micStream = null;
     }
 
-    await sendMicEvent("input_audio_buffer.commit");
-    await sendMicEvent("input_audio_buffer.clear");
+    // Note: With server-side VAD, commit/clear are not supported
+    // The server handles audio buffer management automatically
   } finally {
     micStopping = false;
   }
@@ -1338,6 +1414,31 @@ leaveButton.addEventListener("click", () => {
   });
 });
 
+/**
+ * Send a text message through the realtime WebSocket.
+ * This keeps text and voice on the same Azure connection for unified context.
+ */
+const sendTextViaWebSocket = async (text) => {
+  const ws = await ensureRealtimeSocket();
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    throw new Error("WebSocket not connected");
+  }
+  
+  // DO NOT clear isResponseCancelled here - keep rejecting old audio
+  // until response.created arrives for the new response
+  // This prevents old audio chunks still in flight from playing
+  cancelledResponseId = null;
+  
+  // Reset agent message state for fresh response
+  resetRealtimeAgentMessage();
+  
+  ws.send(JSON.stringify({ type: "text.send", payload: { text } }));
+  
+  // Mark that we're now responding (waiting for agent reply)
+  micResponding = true;
+  micRespondingAt = Date.now();
+};
+
 messageForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   if (!isBackendReady) return;
@@ -1346,7 +1447,6 @@ messageForm.addEventListener("submit", async (event) => {
   
   // If agent is currently responding, cancel it first
   if (micResponding) {
-    console.debug("[form] interrupting ongoing response for text input");
     await cancelCurrentResponse();
   }
   
@@ -1357,21 +1457,14 @@ messageForm.addEventListener("submit", async (event) => {
   if (!sessionId) {
     await ensureSession();
   }
+  
   if (sessionId) {
-    const { data, error } = await streamMessage({
-      text: value,
-      author: "You",
-      // transcript_enabled removed; backend always stores transcripts
-    });
-
-    if (error) {
-      appendMessage("System", error);
-      return;
-    }
-
-    // If streaming didn't produce deltas, pull transcript from backend
-    if (!data?.sawDelta) {
-      await refreshTranscript();
+    try {
+      // Send text through the same WebSocket as voice for unified context
+      await sendTextViaWebSocket(value);
+    } catch (err) {
+      console.error("[form] WebSocket send failed:", err);
+      appendMessage("System", "Failed to send message. Please wait for connection to be ready.");
     }
   }
 });
