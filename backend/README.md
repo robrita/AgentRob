@@ -6,12 +6,17 @@ FastAPI service that manages sessions, transcript state, text replies, and a rea
 
 1. Install uv: `pip install uv`.
 2. Sync dependencies: `uv sync`.
-3. Copy `.env.example` to `.env` and fill Azure settings.
-4. Run: `uv run uvicorn app.main:app --reload --host 0.0.0.0 --port 8000`.
+3. Activate virtual environment:
+   - **Windows**: `.venv\Scripts\activate`
+   - **Linux/macOS**: `source .venv/bin/activate`
+4. Copy `.env.example` to `.env` and fill Azure settings.
+5. Run: `uv run uvicorn app.main:app --reload --host 0.0.0.0 --port 8000`.
 
 ## Quick start (pip)
 
-1. Create and activate a virtual environment.
+1. Create and activate a virtual environment:
+   - **Windows**: `.venv\Scripts\activate`
+   - **Linux/macOS**: `source .venv/bin/activate`
 2. Install dependencies: `pip install -r requirements.txt`.
 3. Copy `.env.example` to `.env` and fill Azure settings.
 4. Run: `uvicorn app.main:app --reload --host 0.0.0.0 --port 8000`.
