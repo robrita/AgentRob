@@ -1242,9 +1242,9 @@ const startMicCapture = async () => {
   await sendMicEvent("input_audio_buffer.clear");
   scheduleRealtimeResponses();
 
-  micAudioContext = new (window.AudioContext || window.webkitAudioContext)({
-    sampleRate: AUDIO_TARGET_SAMPLE_RATE,
-  });
+  // Don't force sample rate - let browser use native rate for mic compatibility
+  // The downsampleBuffer() function handles conversion to AUDIO_TARGET_SAMPLE_RATE
+  micAudioContext = new (window.AudioContext || window.webkitAudioContext)();
   const input = micAudioContext.createMediaStreamSource(micStream);
   micProcessor = micAudioContext.createScriptProcessor(4096, 1, 1);
 
